@@ -35,10 +35,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     // Sanitise numeric parameters
-    $r  = max(0.0, min(3.0, (float)($_POST['r']  ?? 1.0)));
-    $g  = max(0.0, min(3.0, (float)($_POST['g']  ?? 1.0)));
-    $b  = max(0.0, min(3.0, (float)($_POST['b']  ?? 1.0)));
-    $bw = (($_POST['bw'] ?? 'false') === 'true') ? 'true' : 'false';
+    $r           = max(0.0, min(3.0,  (float)($_POST['r']           ?? 1.0)));
+    $g           = max(0.0, min(3.0,  (float)($_POST['g']           ?? 1.0)));
+    $b           = max(0.0, min(3.0,  (float)($_POST['b']           ?? 1.0)));
+    $bw          = (($_POST['bw']          ?? 'false') === 'true') ? 'true' : 'false';
+    $temperature = max(-1.0, min(1.0, (float)($_POST['temperature'] ?? 0.0)));
+    $contrast    = max(-1.0, min(1.0, (float)($_POST['contrast']    ?? 0.0)));
 
     // Forward to Flask API
     $api_url = getenv('API_URL') ?: 'http://localhost:5000/process';
@@ -49,10 +51,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $mime,
             basename($_FILES['image']['name'])
         ),
-        'r'  => $r,
-        'g'  => $g,
-        'b'  => $b,
-        'bw' => $bw,
+        'r'           => $r,
+        'g'           => $g,
+        'b'           => $b,
+        'bw'          => $bw,
+        'temperature' => $temperature,
+        'contrast'    => $contrast,
     ];
 
     $ch = curl_init($api_url);
@@ -310,6 +314,44 @@ header('Content-Type: text/html; charset=UTF-8');
       margin-top: 8px;
     }
 
+    /* ── Sliders ────────────────────────────────────────────────────── */
+    .slider-row { margin-bottom: 18px; }
+    .slider-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: .82rem;
+      color: #aaa;
+      margin-bottom: 6px;
+    }
+    .slider-value { color: #8b90fc; font-weight: 700; min-width: 30px; text-align: right; }
+    .slider-track { display: flex; align-items: center; gap: 8px; }
+    .slider-min, .slider-max { font-size: .72rem; color: #555; white-space: nowrap; }
+    input[type=range] {
+      flex: 1;
+      -webkit-appearance: none;
+      height: 4px;
+      background: #252545;
+      border-radius: 2px;
+      outline: none;
+      cursor: pointer;
+    }
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 16px; height: 16px;
+      background: #8b90fc;
+      border-radius: 50%;
+      cursor: pointer;
+      transition: transform .12s;
+    }
+    input[type=range]::-webkit-slider-thumb:hover { transform: scale(1.25); }
+    input[type=range]::-moz-range-thumb {
+      width: 16px; height: 16px;
+      background: #8b90fc;
+      border: none;
+      border-radius: 50%;
+      cursor: pointer;
+    }
+
     /* ── Responsive ─────────────────────────────────────────────────── */
     @media (max-width: 680px) {
       .preview-grid.active { grid-template-columns: 1fr; }
@@ -380,6 +422,32 @@ header('Content-Type: text/html; charset=UTF-8');
         <span class="toggle-label">Schwarz-Weiß</span>
       </div>
 
+      <!-- Temperature slider -->
+      <div class="slider-row">
+        <div class="slider-label">
+          <span>Tonkurve</span>
+          <span class="slider-value" id="tempDisplay">0</span>
+        </div>
+        <div class="slider-track">
+          <span class="slider-min">Kalt</span>
+          <input type="range" id="tempSlider" min="-100" max="100" value="0" step="1">
+          <span class="slider-max">Warm</span>
+        </div>
+      </div>
+
+      <!-- Contrast slider -->
+      <div class="slider-row">
+        <div class="slider-label">
+          <span>Kontrast</span>
+          <span class="slider-value" id="contrastDisplay">0</span>
+        </div>
+        <div class="slider-track">
+          <span class="slider-min">–</span>
+          <input type="range" id="contrastSlider" min="-100" max="100" value="0" step="1">
+          <span class="slider-max">+</span>
+        </div>
+      </div>
+
       <button class="process-btn" id="processBtn" onclick="processImage()">
         <div class="spinner" id="spinner"></div>
         <span id="processBtnText">Bild verarbeiten</span>
@@ -425,6 +493,9 @@ let uploadedFile = null;
 let isDragging   = false;
 let currentPt    = null;   // {x, y} in canvas pixels
 let channels     = { r: 1, g: 1, b: 1 };
+let temperature  = 0;      // −100 … +100  (sent as −1.0 … +1.0)
+let contrast     = 0;      // −100 … +100  (sent as −1.0 … +1.0)
+let debounceTimer = null;
 
 // Triangle vertices (set in initTriangle)
 let vR, vG, vB;
@@ -591,6 +662,7 @@ function handleTrianglePointer(e) {
   document.getElementById("bVal").textContent = channels.b.toFixed(2) + "×";
 
   drawTriangle();
+  scheduleAutoProcess();
 }
 
 // Mouse events
@@ -610,6 +682,12 @@ function resetTriangle() {
   ["r","g","b"].forEach(c =>
     document.getElementById(c + "Val").textContent = "1.00×"
   );
+  temperature = 0;
+  contrast    = 0;
+  document.getElementById("tempSlider").value      = 0;
+  document.getElementById("tempDisplay").textContent = "0";
+  document.getElementById("contrastSlider").value  = 0;
+  document.getElementById("contrastDisplay").textContent = "0";
   drawTriangle();
 }
 
@@ -628,16 +706,36 @@ uploadZone.addEventListener("drop", (e) => {
 fileInput.addEventListener("change", (e) => { if (e.target.files[0]) loadFile(e.target.files[0]); });
 
 function loadFile(file) {
-  uploadedFile = file;
   const reader = new FileReader();
   reader.onload = (ev) => {
-    document.getElementById("originalImg").src  = ev.target.result;
-    document.getElementById("processedImg").src = ev.target.result;
-    document.getElementById("previewGrid").classList.add("active");
-    document.getElementById("controls").classList.add("active");
-    // Reset triangle and hide previous download
-    resetTriangle();
-    document.getElementById("downloadBtn").classList.remove("active");
+    const img = new Image();
+    img.onload = () => {
+      // Resize to max 800 px client-side to reduce upload payload
+      const MAX_DIM = 800;
+      let w = img.width, h = img.height;
+      if (Math.max(w, h) > MAX_DIM) {
+        if (w >= h) { h = Math.round(h * MAX_DIM / w); w = MAX_DIM; }
+        else        { w = Math.round(w * MAX_DIM / h); h = MAX_DIM; }
+      }
+      const cv = document.createElement("canvas");
+      cv.width = w; cv.height = h;
+      cv.getContext("2d").drawImage(img, 0, 0, w, h);
+      const resizedUrl = cv.toDataURL("image/jpeg", 0.92);
+      cv.toBlob((blob) => {
+        uploadedFile = new File([blob], (function() {
+          const dot = file.name.lastIndexOf(".");
+          return (dot > 0 ? file.name.slice(0, dot) : file.name) + ".jpg";
+        })(), { type: "image/jpeg" });
+        document.getElementById("originalImg").src  = resizedUrl;
+        document.getElementById("processedImg").src = resizedUrl;
+        document.getElementById("previewGrid").classList.add("active");
+        document.getElementById("controls").classList.add("active");
+        resetTriangle();
+        document.getElementById("downloadBtn").classList.remove("active");
+        scheduleAutoProcess();
+      }, "image/jpeg", 0.92);
+    };
+    img.src = ev.target.result;
   };
   reader.readAsDataURL(file);
 }
@@ -656,10 +754,12 @@ function processImage() {
 
   const fd = new FormData();
   fd.append("image", uploadedFile);
-  fd.append("r",  channels.r);
-  fd.append("g",  channels.g);
-  fd.append("b",  channels.b);
-  fd.append("bw", document.getElementById("bwToggle").checked ? "true" : "false");
+  fd.append("r",           channels.r);
+  fd.append("g",           channels.g);
+  fd.append("b",           channels.b);
+  fd.append("bw",          document.getElementById("bwToggle").checked ? "true" : "false");
+  fd.append("temperature", (temperature / 100).toFixed(3));
+  fd.append("contrast",    (contrast    / 100).toFixed(3));
 
   fetch("index.php", { method: "POST", body: fd })
     .then((res) => res.json())
@@ -680,6 +780,30 @@ function processImage() {
       spinner.style.display = "none";
     });
 }
+
+// ── Debounced auto-processing ──────────────────────────────────────────────
+function scheduleAutoProcess() {
+  if (!uploadedFile) return;
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(processImage, 600);
+}
+
+// ── Slider controls ────────────────────────────────────────────────────────
+document.getElementById("tempSlider").addEventListener("input", function () {
+  temperature = parseInt(this.value, 10);
+  document.getElementById("tempDisplay").textContent = temperature;
+  scheduleAutoProcess();
+});
+
+document.getElementById("contrastSlider").addEventListener("input", function () {
+  contrast = parseInt(this.value, 10);
+  document.getElementById("contrastDisplay").textContent = contrast;
+  scheduleAutoProcess();
+});
+
+document.getElementById("bwToggle").addEventListener("change", function () {
+  scheduleAutoProcess();
+});
 
 // ── Init ───────────────────────────────────────────────────────────────────
 initTriangle();

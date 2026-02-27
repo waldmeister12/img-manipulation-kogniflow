@@ -9,10 +9,11 @@ Endpoints:
 
 import base64
 import io
+import math
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from PIL import Image, ImageOps
+from PIL import Image, ImageEnhance, ImageOps
 
 app = Flask(__name__)
 CORS(app)
@@ -21,7 +22,7 @@ CORS(app)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "bmp", "webp"}
-MAX_DIMENSION = 1200  # px – resize larger images for performance
+MAX_DIMENSION = 800  # px – resize larger images for performance
 
 
 def _allowed(filename: str) -> bool:
@@ -42,27 +43,48 @@ def process_image():
 
     try:
         # --- Parse parameters ------------------------------------------------
-        r_mult = max(0.0, min(3.0, float(request.form.get("r", 1.0))))
-        g_mult = max(0.0, min(3.0, float(request.form.get("g", 1.0))))
-        b_mult = max(0.0, min(3.0, float(request.form.get("b", 1.0))))
-        bw = request.form.get("bw", "false").lower() == "true"
+        r_mult      = max(0.0, min(3.0, float(request.form.get("r",           1.0))))
+        g_mult      = max(0.0, min(3.0, float(request.form.get("g",           1.0))))
+        b_mult      = max(0.0, min(3.0, float(request.form.get("b",           1.0))))
+        bw          = request.form.get("bw", "false").lower() == "true"
+        temperature = max(-1.0, min(1.0, float(request.form.get("temperature", 0.0))))
+        contrast    = max(-1.0, min(1.0, float(request.form.get("contrast",    0.0))))
 
         # --- Load & optionally resize ----------------------------------------
         img = Image.open(file.stream).convert("RGB")
         if max(img.size) > MAX_DIMENSION:
             img.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
 
-        # --- Black-and-white conversion --------------------------------------
-        if bw:
-            img = ImageOps.grayscale(img).convert("RGB")
-
-        # --- Per-channel brightness multipliers ------------------------------
+        # --- Per-channel brightness multipliers (applied before B&W so the
+        #     triangle acts as a colour-filter, simulating lens filters) -------
         if r_mult != 1.0 or g_mult != 1.0 or b_mult != 1.0:
             r_ch, g_ch, b_ch = img.split()
             r_ch = r_ch.point(lambda x: min(255, int(x * r_mult)))
             g_ch = g_ch.point(lambda x: min(255, int(x * g_mult)))
             b_ch = b_ch.point(lambda x: min(255, int(x * b_mult)))
             img = Image.merge("RGB", (r_ch, g_ch, b_ch))
+
+        # --- Black-and-white conversion --------------------------------------
+        if bw:
+            img = ImageOps.grayscale(img).convert("RGB")
+
+        # --- Temperature tone curve (tanh S-curve) ---------------------------
+        # Positive  → warm/contrasty (shadows darker, highlights brighter)
+        # Negative  → cool/flat      (shadows lifted, highlights compressed)
+        if abs(temperature) > 0.001:
+            k = temperature * 2.5
+            lut = [
+                int(min(255, max(0, round(
+                    127.5 + 127.5 * math.tanh(k * (x / 255.0 - 0.5))
+                ))))
+                for x in range(256)
+            ]
+            img = img.point(lut * 3)  # 256 values × 3 bands (R, G, B)
+
+        # --- Contrast enhancement --------------------------------------------
+        if abs(contrast) > 0.001:
+            factor = 1.0 + contrast * (1.5 if contrast >= 0 else 0.8)
+            img = ImageEnhance.Contrast(img).enhance(factor)
 
         # --- Encode result ---------------------------------------------------
         buf = io.BytesIO()
